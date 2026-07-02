@@ -1619,6 +1619,7 @@
       <div id="scanner-result" class="scanner-result" hidden></div>
       <div class="overlay-actions">
         <button class="action-button secondary" type="button" id="scanner-restart">Scan again</button>
+        <button class="action-button secondary" type="button" id="scanner-switch">Switch camera</button>
         <button class="action-button danger" type="button" id="scanner-stop">Close scanner</button>
       </div>
     </section>
@@ -1711,7 +1712,10 @@
         scanLock: false,
         detectedProduct: null,
         detectedFormat: "",
-        detectedRaw: ""
+        detectedRaw: "",
+        devices: [],
+        preferredDeviceId: "",
+        autoSelectedDeviceId: ""
       }
     };
 
@@ -1762,6 +1766,7 @@
       scannerStatus: document.getElementById("scanner-status"),
       scannerResult: document.getElementById("scanner-result"),
       scannerRestart: document.getElementById("scanner-restart"),
+      scannerSwitch: document.getElementById("scanner-switch"),
       scannerStop: document.getElementById("scanner-stop")
     };
 
@@ -2394,28 +2399,124 @@ Price Preset: ${price}`
       }
     }
 
+    function buildVideoConstraints(deviceId = "") {
+      if (deviceId) {
+        return {
+          deviceId: { exact: deviceId },
+          width: { ideal: 640 },
+          height: { ideal: 480 }
+        };
+      }
+
+      return {
+        facingMode: { ideal: "environment" },
+        width: { ideal: 640 },
+        height: { ideal: 480 }
+      };
+    }
+
+    function scoreCameraDevice(device, index) {
+      const label = String(device.label || "").toLowerCase();
+      let score = 0;
+
+      if (/back|rear|environment/.test(label)) {
+        score += 90;
+      }
+      if (/wide/.test(label)) {
+        score += 35;
+      }
+      if (/ultra/.test(label)) {
+        score += 20;
+      }
+      if (/0\\.5|0,5|0x5/.test(label)) {
+        score += 12;
+      }
+      if (/front|user|facetime|selfie/.test(label)) {
+        score -= 120;
+      }
+      if (/tele|zoom|2x|3x|5x/.test(label)) {
+        score -= 90;
+      }
+
+      return score - index;
+    }
+
+    async function refreshScannerDevices() {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
+        state.scanner.devices = [];
+        return [];
+      }
+
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      state.scanner.devices = devices.filter((device) => device.kind === "videoinput");
+      elements.scannerSwitch.disabled = state.scanner.devices.length <= 1;
+      return state.scanner.devices;
+    }
+
+    function chooseLeastZoomedDevice(devices) {
+      if (!devices.length) {
+        return null;
+      }
+
+      return devices
+        .map((device, index) => ({ device, score: scoreCameraDevice(device, index) }))
+        .sort((a, b) => b.score - a.score)[0].device;
+    }
+
+    async function openCameraStream(deviceId = "") {
+      return navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: buildVideoConstraints(deviceId)
+      });
+    }
+
     async function requestScannerStream() {
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         throw new Error("This browser does not expose live camera access. Use Safari/Chrome over HTTPS or localhost.");
       }
 
-      const preferred = {
-        audio: false,
-        video: {
-          facingMode: { ideal: "environment" },
-          width: { ideal: 1280 },
-          height: { ideal: 720 }
-        }
-      };
-
       try {
-        return await navigator.mediaDevices.getUserMedia(preferred);
+        const requestedDeviceId = state.scanner.preferredDeviceId || state.scanner.autoSelectedDeviceId;
+        const initialStream = await openCameraStream(requestedDeviceId);
+        const devices = await refreshScannerDevices();
+        const currentDeviceId = initialStream.getVideoTracks()[0]?.getSettings?.().deviceId || "";
+
+        if (!requestedDeviceId && devices.length > 1) {
+          const bestDevice = chooseLeastZoomedDevice(devices);
+          if (bestDevice && bestDevice.deviceId && bestDevice.deviceId !== currentDeviceId) {
+            initialStream.getTracks().forEach((track) => track.stop());
+            state.scanner.autoSelectedDeviceId = bestDevice.deviceId;
+            return await openCameraStream(bestDevice.deviceId);
+          }
+        }
+
+        return initialStream;
       } catch (error) {
         if (error && error.name === "OverconstrainedError") {
           return navigator.mediaDevices.getUserMedia({ audio: false, video: true });
         }
         throw error;
       }
+    }
+
+    async function switchScannerCamera() {
+      const devices = state.scanner.devices.length ? state.scanner.devices : await refreshScannerDevices();
+      if (devices.length <= 1) {
+        setScannerStatus("info", "Only one camera is available to this browser.");
+        return;
+      }
+
+      const currentDeviceId =
+        state.scanner.stream?.getVideoTracks?.()[0]?.getSettings?.().deviceId ||
+        state.scanner.preferredDeviceId ||
+        state.scanner.autoSelectedDeviceId;
+      const currentIndex = Math.max(0, devices.findIndex((device) => device.deviceId === currentDeviceId));
+      const nextDevice = devices[(currentIndex + 1) % devices.length];
+
+      state.scanner.preferredDeviceId = nextDevice.deviceId;
+      state.scanner.autoSelectedDeviceId = "";
+      setScannerStatus("info", `Switching to ${nextDevice.label || "next camera"}...`);
+      await startScanner();
     }
 
     async function normalizeScannerCamera(stream) {
@@ -3028,6 +3129,7 @@ Price Preset: ${price}`
     elements.scannerClose.addEventListener("click", closeScannerOverlay);
     elements.scannerStop.addEventListener("click", closeScannerOverlay);
     elements.scannerRestart.addEventListener("click", startScanner);
+    elements.scannerSwitch.addEventListener("click", switchScannerCamera);
 
     window.addEventListener("popstate", async () => {
       const query = new URL(window.location.href).searchParams.get("q") || "";
